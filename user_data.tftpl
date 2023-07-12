@@ -1,0 +1,58 @@
+#cloud-config
+users:
+  - name: ${sudo_user}
+    groups: users, admin, docker
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+    %{ for key in public_keys ~}
+      - ${key}
+    %{ endfor ~}
+package_update: true
+package_upgrade: true
+packages:
+  - ca-certificates 
+  - curl 
+  - gnupg
+  - fail2ban
+  - ufw
+runcmd:
+  - printf "[sshd]\nenabled = true\nbanaction = iptables-multiport" > /etc/fail2ban/jail.local
+  - systemctl enable fail2ban
+  - systemctl start fail2ban
+  - ufw allow 'OpenSSH'
+  - ufw allow 51820
+  - ufw allow http
+  - ufw allow https
+  - ufw enable
+  - sed -ie '/^PermitRootLogin/s/^.*$/PermitRootLogin no/' /etc/ssh/sshd_config
+  - sed -ie '/^PasswordAuthentication/s/^.*$/PasswordAuthentication no/' /etc/ssh/sshd_config
+  - sed -ie '/^X11Forwarding/s/^.*$/X11Forwarding no/' /etc/ssh/sshd_config
+  - sed -ie '/^#MaxAuthTries/s/^.*$/MaxAuthTries 2/' /etc/ssh/sshd_config
+  - sed -ie '/^#AllowTcpForwarding/s/^.*$/AllowTcpForwarding no/' /etc/ssh/sshd_config
+  - sed -ie '/^#AllowAgentForwarding/s/^.*$/AllowAgentForwarding no/' /etc/ssh/sshd_config
+  - sed -ie '/^#AuthorizedKeysFile/s/^.*$/AuthorizedKeysFile .ssh/authorized_keys/' /etc/ssh/sshd_config
+  - sed -i '$a AllowUsers ${sudo_user}' /etc/ssh/sshd_config
+  - systemctl restart ssh
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  - chmod a+r /etc/apt/keyrings/docker.gpg
+  - echo "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+  - apt update
+  - apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - system enable docker
+  - mkdir /opt/firezone
+  - curl -fsSL https://raw.githubusercontent.com/firezone/firezone/master/docker-compose.prod.yml -o /opt/firezone/docker-compose.yml
+  - docker run --rm firezone/firezone bin/gen-env > /opt/firezone/.env
+  - sed -i "s/DEFAULT_ADMIN_PASSWORD=.*/DEFAULT_ADMIN_PASSWORD=${admin_password}/" "/opt/firezone/.env"
+  - sed -i "s/DEFAULT_ADMIN_EMAIL=.*/DEFAULT_ADMIN_EMAIL=${admin_email}/" "/opt/firezone/.env"
+  - sed -i "s~EXTERNAL_URL=.*~EXTERNAL_URL=${domain_name}~" "/opt/firezone/.env"
+  - sed -i "s/DATABASE_PASSWORD=.*/DATABASE_PASSWORD=${database_password}/" "/opt/firezone/.env"
+  - sed -i."s~VERSION=.*~VERSION=${version}~" "/opt/firezone/.env"
+  - echo "TLS_OPTS=\"tls {\n\t\ton_demand\n\t}\"" >> "/opt/firezone/.env"
+  - echo "TELEMETRY_ENABLED=${telemetry}" >> "/opt/firezone/.env"
+  - echo "TID=$(od -vN "8" -An -tx1 /dev/urandom | tr -d " \n" ; echo)" >> "/opt/firezone/.env"
+  - docker compose -f /opt/firezone/docker-compose.yml exec postgres psql -p 5432 -U postgres -d firezone -h 127.0.0.1 -c "ALTER ROLE postgres WITH PASSWORD '${database_password}'"
+  - docker compose -f /opt/firezone/docker-compose.yml run --rm firezone bin/migrate
+  - docker compose -f /opt/firezone/docker-compose.yml run --rm firezone bin/create-or-reset-admin
+  - docker compose -f /opt/firezone/docker-compose.yml up -d
